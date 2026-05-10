@@ -170,10 +170,10 @@ struct ioring_data {
 	int adapt_active_idx;		/* 0 = polling (SQPOLL), 1 = interrupt */
 	int adapt_sample_countdown;
 	struct timespec adapt_start_ts;
-	struct timespec adapt_last_sample_ts;
 	struct timespec adapt_last_switch_ts;
 	struct timespec adapt_window_start;
-	uint64_t adapt_last_cpu_ns;
+	uint64_t adapt_last_total_jiffies;
+	uint64_t adapt_last_idle_jiffies;
 	int adapt_saved_disable_slat;
 	unsigned int adapt_switches;
 	unsigned int adapt_switches_in_window;
@@ -1184,58 +1184,51 @@ static int fio_ioring_adaptive_init(struct thread_data *td)
 	ld->adapt_sample_countdown = o->adaptive_sample_every;
 	ld->adapt_saved_disable_slat = td->o.disable_slat;
 	fio_gettime(&ld->adapt_start_ts, NULL);
-	ld->adapt_last_sample_ts = ld->adapt_start_ts;
 	ld->adapt_last_switch_ts = ld->adapt_start_ts;
 	ld->adapt_window_start = ld->adapt_start_ts;
-	ld->adapt_last_cpu_ns = 0;
+	ld->adapt_last_total_jiffies = 0;
+	ld->adapt_last_idle_jiffies = 0;
 
 	return 0;
 }
 
 /*
- * Read /proc/self/stat fields 14 (utime) and 15 (stime) and convert to ns.
- * Returns 0 on success, fills *out_ns with cumulative CPU time of this process.
+ * Read the aggregate "cpu " line from /proc/stat (system-wide jiffies).
+ * Returns 0 on success and fills *total / *idle with cumulative jiffies
+ * across all CPUs.
+ *
+ * NOTE: We deliberately use system-wide CPU rather than /proc/self/stat.
+ * If we measured fio's own CPU we'd see ~100% in SQPOLL mode (busy reap)
+ * and ~25% in interrupt mode, which would oscillate the policy on idle
+ * systems. The point of the policy is to react to *external* load — when
+ * other workloads make polling wasteful — and that requires a system view.
  */
-static int adaptive_read_proc_cpu_ns(uint64_t *out_ns)
+static int adaptive_read_proc_stat(uint64_t *total, uint64_t *idle)
 {
 	FILE *fp;
-	long ticks_per_sec;
-	unsigned long utime, stime;
-	int n;
-	char buf[1024], *p;
+	char buf[1024];
+	unsigned long long u = 0, n = 0, s = 0, i = 0, w = 0,
+			   irq = 0, sirq = 0, st = 0;
+	int n_fields;
 
-	fp = fopen("/proc/self/stat", "r");
+	fp = fopen("/proc/stat", "r");
 	if (!fp)
 		return -1;
-
 	if (!fgets(buf, sizeof(buf), fp)) {
 		fclose(fp);
 		return -1;
 	}
 	fclose(fp);
 
-	/*
-	 * The 2nd field is comm in parens and may contain spaces or ')'.
-	 * Skip past the last ')' to start scanning from field 3.
-	 */
-	p = strrchr(buf, ')');
-	if (!p)
-		return -1;
-	p++;
-
-	/* From field 3 onward: state(1) ppid(2) pgrp(3) ... utime is field 14, stime is 15.
-	 * After the closing ')' we are about to read field 3, so skip 11 fields (3..13)
-	 * to land on utime, then read utime and stime. */
-	n = sscanf(p, " %*s %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
-		   &utime, &stime);
-	if (n != 2)
+	/* "cpu  user nice system idle iowait irq softirq steal guest guest_nice" */
+	n_fields = sscanf(buf, "cpu  %llu %llu %llu %llu %llu %llu %llu %llu",
+			  &u, &n, &s, &i, &w, &irq, &sirq, &st);
+	if (n_fields < 4)
 		return -1;
 
-	ticks_per_sec = sysconf(_SC_CLK_TCK);
-	if (ticks_per_sec <= 0)
-		ticks_per_sec = 100;
-
-	*out_ns = (uint64_t)(utime + stime) * 1000000000ULL / (uint64_t)ticks_per_sec;
+	/* Treat iowait as idle (CPU is not doing useful work either way). */
+	*idle = i + w;
+	*total = u + n + s + i + w + irq + sirq + st;
 	return 0;
 }
 
@@ -1325,6 +1318,15 @@ static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
 	ld->adapt_switches++;
 	fio_gettime(&ld->adapt_last_switch_ts, NULL);
 
+	/*
+	 * Force the next sample to re-baseline. The drain + ring rebuild
+	 * occupies measurable wall time during which the system was mostly
+	 * blocked on close/mmap; folding that into the next CPU% would
+	 * skew the policy and induce oscillation.
+	 */
+	ld->adapt_last_total_jiffies = 0;
+	ld->adapt_last_idle_jiffies = 0;
+
 	log_info("io_uring: adaptive switch -> %s at t=%llu ms (switch #%u)\n",
 		 new_idx == 0 ? "polling" : "interrupt",
 		 (unsigned long long) mtime_since(&ld->adapt_start_ts,
@@ -1343,7 +1345,7 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 	struct ioring_data *ld = td->io_ops_data;
 	struct ioring_options *o = td->eo;
 	struct timespec now;
-	uint64_t cpu_ns_now, dt_wall_ns, dt_cpu_ns;
+	uint64_t cur_total, cur_idle, dt_total, dt_idle;
 	unsigned int cpu_pct;
 	unsigned int qd_now;
 	int want_idx;
@@ -1362,30 +1364,38 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 	if (ld->adapt_switches_in_window >= o->adaptive_max_switch_per_sec)
 		return;
 
-	if (adaptive_read_proc_cpu_ns(&cpu_ns_now))
+	if (adaptive_read_proc_stat(&cur_total, &cur_idle))
 		return;
 
-	dt_wall_ns = utime_since(&ld->adapt_last_sample_ts, &now) * 1000ULL;
-	if (dt_wall_ns == 0 || ld->adapt_last_cpu_ns == 0) {
-		ld->adapt_last_cpu_ns = cpu_ns_now;
-		ld->adapt_last_sample_ts = now;
+	/*
+	 * First sample (or first sample after a switch) just records the
+	 * baseline — we need two readings to compute a delta.
+	 */
+	if (ld->adapt_last_total_jiffies == 0) {
+		ld->adapt_last_total_jiffies = cur_total;
+		ld->adapt_last_idle_jiffies = cur_idle;
 		return;
 	}
-	dt_cpu_ns = cpu_ns_now - ld->adapt_last_cpu_ns;
-	cpu_pct = (unsigned int)((dt_cpu_ns * 100ULL) / dt_wall_ns);
 
-	ld->adapt_last_cpu_ns = cpu_ns_now;
-	ld->adapt_last_sample_ts = now;
+	dt_total = cur_total - ld->adapt_last_total_jiffies;
+	dt_idle = cur_idle - ld->adapt_last_idle_jiffies;
+	ld->adapt_last_total_jiffies = cur_total;
+	ld->adapt_last_idle_jiffies = cur_idle;
+
+	if (dt_total == 0)
+		return;
+	if (dt_idle > dt_total)
+		dt_idle = dt_total;
+	cpu_pct = (unsigned int)(((dt_total - dt_idle) * 100ULL) / dt_total);
 
 	qd_now = td->cur_depth;
 
 	/*
-	 * Decision policy:
-	 * - In polling (SQPOLL) mode, drop to interrupt if CPU > cpu_hi
-	 *   (the SQPOLL kthread itself burns a core, so this triggers easily
-	 *   under contention from other workloads).
-	 * - In interrupt mode, return to polling if CPU < cpu_lo AND inflight
-	 *   QD >= qd_lo (enough parallelism to amortize the polling cost).
+	 * Decision policy (system-wide CPU):
+	 * - In polling mode, drop to interrupt if system busy >= cpu_hi
+	 *   (other workloads are competing for cores; polling is wasteful).
+	 * - In interrupt mode, return to polling if system busy <= cpu_lo
+	 *   AND inflight QD >= qd_lo (idle system + enough parallelism).
 	 */
 	want_idx = ld->adapt_active_idx;
 	if (ld->adapt_active_idx == 0 && cpu_pct >= o->adaptive_cpu_hi)
