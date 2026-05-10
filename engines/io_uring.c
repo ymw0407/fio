@@ -214,6 +214,7 @@ struct ioring_options {
 	unsigned int adaptive_cooldown_ms;
 	unsigned int adaptive_max_switch_per_sec;
 	unsigned int adaptive_sample_every;
+	unsigned int adaptive_debug;	/* if set, log every (throttled) sample */
 };
 
 static unsigned int enter_flags = IORING_ENTER_GETEVENTS;
@@ -1126,6 +1127,8 @@ static int adaptive_parse_kv(struct ioring_options *o, const char *kv)
 		o->adaptive_max_switch_per_sec = val;
 	else if (!strncmp(kv, "sample_every=", 13))
 		o->adaptive_sample_every = val;
+	else if (!strncmp(kv, "debug=", 6))
+		o->adaptive_debug = val;
 	else {
 		log_err("io_uring: adaptive_mode: unknown key '%s'\n", kv);
 		return -1;
@@ -1303,19 +1306,27 @@ static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
 		/*
 		 * The previous registration left the real fds in ld->fds[] while
 		 * f->fd was set to -1 ("pretend-closed"). Closing the ring fd does
-		 * NOT close those userspace fds — we must close them ourselves
-		 * before fio_ioring_register_files reopens them, or we leak.
+		 * NOT close those userspace fds, and the stale file_hash entry
+		 * from the original generic_open_file would cause the next open
+		 * to take the "hash hit" path and skip cache invalidation cleanly
+		 * (we'd see "cache invalidation ... Bad file descriptor" warnings).
+		 *
+		 * Restore the real fd into f->fd and route through generic_close_file,
+		 * which both close()s the fd AND removes the file_hash entry. The
+		 * subsequent fio_ioring_register_files() then does a fresh
+		 * generic_open_file() with proper hash registration.
 		 */
 		if (ld->fds) {
-			for (i = 0; i < td->o.nr_files; i++) {
-				if (ld->fds[i] >= 0)
-					close(ld->fds[i]);
+			for_each_file(td, f, i) {
+				if (ld->fds[i] >= 0) {
+					f->fd = ld->fds[i];
+					generic_close_file(td, f);
+					/* generic_close_file sets f->fd = -1 */
+				}
 			}
 			free(ld->fds);
 			ld->fds = NULL;
 		}
-		for_each_file(td, f, i)
-			f->engine_pos = 0;
 
 		ret = fio_ioring_register_files(td);
 		if (ret) {
@@ -1411,6 +1422,26 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 	cpu_pct = (unsigned int)(((dt_total - dt_idle) * 100ULL) / dt_total);
 
 	qd_now = td->cur_depth;
+
+	/*
+	 * Optional debug trace — emit at most once per cooldown_ms so the
+	 * log isn't flooded. Reuses adapt_window_start as the rate limiter
+	 * (it's only otherwise touched by the per-second switch counter,
+	 * and missing one rate-limit window is harmless).
+	 */
+	if (o->adaptive_debug) {
+		static __thread struct timespec last_dbg;
+		if (mtime_since(&last_dbg, &now) >= o->adaptive_cooldown_ms) {
+			log_info("io_uring: adaptive sample t=%llu mode=%s "
+				 "cpu=%u%% qd=%u dt_total=%llu dt_idle=%llu\n",
+				 (unsigned long long) mtime_since(&ld->adapt_start_ts, &now),
+				 ld->adapt_active_idx == 0 ? "polling" : "interrupt",
+				 cpu_pct, qd_now,
+				 (unsigned long long) dt_total,
+				 (unsigned long long) dt_idle);
+			last_dbg = now;
+		}
+	}
 
 	/*
 	 * Decision policy (system-wide CPU):
