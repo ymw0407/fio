@@ -171,9 +171,10 @@ struct ioring_data {
 	int adapt_sample_countdown;
 	struct timespec adapt_start_ts;
 	struct timespec adapt_last_switch_ts;
-	struct timespec adapt_window_start;
-	uint64_t adapt_last_total_jiffies;
-	uint64_t adapt_last_idle_jiffies;
+	struct timespec adapt_rate_window_start;	/* for max_switch_per_sec */
+	struct timespec adapt_eval_baseline_ts;	/* start of current eval window */
+	uint64_t adapt_eval_baseline_total;	/* /proc/stat at window start */
+	uint64_t adapt_eval_baseline_idle;
 	int adapt_saved_disable_slat;
 	unsigned int adapt_switches;
 	unsigned int adapt_switches_in_window;
@@ -214,6 +215,7 @@ struct ioring_options {
 	unsigned int adaptive_cooldown_ms;
 	unsigned int adaptive_max_switch_per_sec;
 	unsigned int adaptive_sample_every;
+	unsigned int adaptive_eval_window_ms;	/* sliding window for cpu_pct */
 	unsigned int adaptive_debug;	/* if set, log every (throttled) sample */
 };
 
@@ -1127,6 +1129,8 @@ static int adaptive_parse_kv(struct ioring_options *o, const char *kv)
 		o->adaptive_max_switch_per_sec = val;
 	else if (!strncmp(kv, "sample_every=", 13))
 		o->adaptive_sample_every = val;
+	else if (!strncmp(kv, "eval_window_ms=", 15))
+		o->adaptive_eval_window_ms = val;
 	else if (!strncmp(kv, "debug=", 6))
 		o->adaptive_debug = val;
 	else {
@@ -1151,6 +1155,7 @@ static int fio_ioring_adaptive_init(struct thread_data *td)
 	o->adaptive_cooldown_ms = ADAPT_DEFAULT_COOLDOWN_MS;
 	o->adaptive_max_switch_per_sec = ADAPT_DEFAULT_MAX_SW_PER_SEC;
 	o->adaptive_sample_every = ADAPT_DEFAULT_SAMPLE_EVERY;
+	o->adaptive_eval_window_ms = 0;	/* set after parse, defaults to cooldown_ms */
 
 	dup = strdup(o->adaptive_mode_str);
 	if (!dup)
@@ -1178,6 +1183,9 @@ static int fio_ioring_adaptive_init(struct thread_data *td)
 		return -1;
 	}
 
+	if (o->adaptive_eval_window_ms == 0)
+		o->adaptive_eval_window_ms = o->adaptive_cooldown_ms;
+
 	o->adaptive_enabled = 1;
 
 	/* Adaptive mode forces SQPOLL on at startup; we toggle it later. */
@@ -1189,18 +1197,19 @@ static int fio_ioring_adaptive_init(struct thread_data *td)
 	ld->adapt_saved_disable_slat = td->o.disable_slat;
 	fio_gettime(&ld->adapt_start_ts, NULL);
 	ld->adapt_last_switch_ts = ld->adapt_start_ts;
-	ld->adapt_window_start = ld->adapt_start_ts;
+	ld->adapt_rate_window_start = ld->adapt_start_ts;
+	ld->adapt_eval_baseline_ts = ld->adapt_start_ts;
 
 	/*
-	 * Capture an initial /proc/stat baseline so the first decision (right
-	 * after the startup cooldown expires) computes CPU% over a meaningful
-	 * window (~cooldown_ms) instead of a few milliseconds of noise. Falls
-	 * back to lazy init in the sampler if the read fails.
+	 * Capture an initial /proc/stat baseline. The sampler refreshes this
+	 * every adaptive_eval_window_ms so cpu_pct reflects the recent window,
+	 * not the cumulative average since startup (which would wash out brief
+	 * load spikes).
 	 */
-	if (adaptive_read_proc_stat(&ld->adapt_last_total_jiffies,
-				    &ld->adapt_last_idle_jiffies)) {
-		ld->adapt_last_total_jiffies = 0;
-		ld->adapt_last_idle_jiffies = 0;
+	if (adaptive_read_proc_stat(&ld->adapt_eval_baseline_total,
+				    &ld->adapt_eval_baseline_idle)) {
+		ld->adapt_eval_baseline_total = 0;
+		ld->adapt_eval_baseline_idle = 0;
 	}
 
 	return 0;
@@ -1342,17 +1351,17 @@ static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
 	fio_gettime(&ld->adapt_last_switch_ts, NULL);
 
 	/*
-	 * Capture a fresh /proc/stat baseline AFTER the switch completes, so
-	 * the next sample's delta covers the cooldown window (~hundreds of ms,
-	 * many jiffies) instead of just the gap between two adjacent samples
-	 * (sub-ms, 0-1 jiffy → discretization noise that pegs cpu_pct to 0% or
-	 * 100% and induces metronomic oscillation).
+	 * Anchor the next evaluation window at this switch point, so the first
+	 * post-switch decision is computed over a window entirely after the
+	 * mode change (excludes the drain pause and any pre-switch load that
+	 * may no longer be representative).
 	 */
-	if (adaptive_read_proc_stat(&ld->adapt_last_total_jiffies,
-				    &ld->adapt_last_idle_jiffies)) {
-		ld->adapt_last_total_jiffies = 0;
-		ld->adapt_last_idle_jiffies = 0;
+	if (adaptive_read_proc_stat(&ld->adapt_eval_baseline_total,
+				    &ld->adapt_eval_baseline_idle)) {
+		ld->adapt_eval_baseline_total = 0;
+		ld->adapt_eval_baseline_idle = 0;
 	}
+	ld->adapt_eval_baseline_ts = ld->adapt_last_switch_ts;
 
 	log_info("io_uring: adaptive switch -> %s at t=%llu ms (switch #%u)\n",
 		 new_idx == 0 ? "polling" : "interrupt",
@@ -1366,6 +1375,12 @@ static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
 /*
  * Sampler — invoked from getevents on a countdown. Decides whether to
  * tear down and rebuild the ring with a different SQPOLL setting.
+ *
+ * The sampler accumulates a sliding evaluation window (adaptive_eval_window_ms,
+ * default = cooldown_ms). At each sample we read /proc/stat; once the window
+ * fills, we compute CPU% over JUST that window, refresh the baseline, and
+ * make a decision (gated by cooldown). This means cpu_pct reflects "recent"
+ * load, not the cumulative average since startup.
  */
 static void fio_ioring_adaptive_sample(struct thread_data *td)
 {
@@ -1375,47 +1390,41 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 	uint64_t cur_total, cur_idle, dt_total, dt_idle;
 	unsigned int cpu_pct;
 	unsigned int qd_now;
-	int want_idx;
+	int want_idx, in_cooldown;
 
 	fio_gettime(&now, NULL);
 
-	/* Cooldown: don't switch faster than cooldown_ms. */
-	if (mtime_since(&ld->adapt_last_switch_ts, &now) < o->adaptive_cooldown_ms)
-		return;
-
-	/* Rate cap: max_switch_per_sec sliding window. */
-	if (mtime_since(&ld->adapt_window_start, &now) >= 1000) {
-		ld->adapt_window_start = now;
+	/* Rate cap: max_switch_per_sec sliding window. Independent of the
+	 * eval window — caps how often we'll actually act on a decision. */
+	if (mtime_since(&ld->adapt_rate_window_start, &now) >= 1000) {
+		ld->adapt_rate_window_start = now;
 		ld->adapt_switches_in_window = 0;
 	}
-	if (ld->adapt_switches_in_window >= o->adaptive_max_switch_per_sec)
-		return;
 
 	if (adaptive_read_proc_stat(&cur_total, &cur_idle))
 		return;
 
-	/*
-	 * Lazy-initialize baseline at the very first sample (init couldn't
-	 * call adaptive_read_proc_stat without dragging more deps). Subsequent
-	 * baselines are captured at switch time, NOT here — we want the delta
-	 * computed against the longest available window so the percentage isn't
-	 * dominated by jiffy quantization.
-	 */
-	if (ld->adapt_last_total_jiffies == 0) {
-		ld->adapt_last_total_jiffies = cur_total;
-		ld->adapt_last_idle_jiffies = cur_idle;
+	/* Lazy-initialize baseline if startup read failed. */
+	if (ld->adapt_eval_baseline_total == 0) {
+		ld->adapt_eval_baseline_total = cur_total;
+		ld->adapt_eval_baseline_idle = cur_idle;
+		ld->adapt_eval_baseline_ts = now;
 		return;
 	}
 
-	dt_total = cur_total - ld->adapt_last_total_jiffies;
-	dt_idle = cur_idle - ld->adapt_last_idle_jiffies;
+	/* Has the evaluation window completed? */
+	if (mtime_since(&ld->adapt_eval_baseline_ts, &now) < o->adaptive_eval_window_ms)
+		return;
 
-	/*
-	 * Require a minimum window of jiffies for a stable percentage. With
-	 * HZ=100 and N CPUs, every 10ms of wall time produces N jiffies of
-	 * dt_total; we want >= cooldown_ms worth, but cap the wait so the
-	 * sampler still runs even on very low-IOPS workloads.
-	 */
+	dt_total = cur_total - ld->adapt_eval_baseline_total;
+	dt_idle = cur_idle - ld->adapt_eval_baseline_idle;
+
+	/* Refresh window baseline for the next iteration. */
+	ld->adapt_eval_baseline_total = cur_total;
+	ld->adapt_eval_baseline_idle = cur_idle;
+	ld->adapt_eval_baseline_ts = now;
+
+	/* Skip pathologically short windows (e.g., system clock skew). */
 	if (dt_total < 8)
 		return;
 	if (dt_idle > dt_total)
@@ -1424,28 +1433,29 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 
 	qd_now = td->cur_depth;
 
-	/*
-	 * Optional debug trace — emit at most once per cooldown_ms so the
-	 * log isn't flooded. Reuses adapt_window_start as the rate limiter
-	 * (it's only otherwise touched by the per-second switch counter,
-	 * and missing one rate-limit window is harmless).
-	 */
 	if (o->adaptive_debug) {
-		static __thread struct timespec last_dbg;
-		if (mtime_since(&last_dbg, &now) >= o->adaptive_cooldown_ms) {
-			log_info("io_uring: adaptive sample t=%llu mode=%s "
-				 "cpu=%u%% qd=%u dt_total=%llu dt_idle=%llu\n",
-				 (unsigned long long) mtime_since(&ld->adapt_start_ts, &now),
-				 ld->adapt_active_idx == 0 ? "polling" : "interrupt",
-				 cpu_pct, qd_now,
-				 (unsigned long long) dt_total,
-				 (unsigned long long) dt_idle);
-			last_dbg = now;
-		}
+		log_info("io_uring: adaptive sample t=%llu mode=%s "
+			 "cpu=%u%% qd=%u dt_total=%llu dt_idle=%llu\n",
+			 (unsigned long long) mtime_since(&ld->adapt_start_ts, &now),
+			 ld->adapt_active_idx == 0 ? "polling" : "interrupt",
+			 cpu_pct, qd_now,
+			 (unsigned long long) dt_total,
+			 (unsigned long long) dt_idle);
 	}
 
+	/* Cooldown gate is checked AFTER baseline refresh so the next window
+	 * is always anchored at the latest /proc/stat read, even if we can't
+	 * act on this evaluation. */
+	in_cooldown = mtime_since(&ld->adapt_last_switch_ts, &now)
+		< o->adaptive_cooldown_ms;
+	if (in_cooldown)
+		return;
+
+	if (ld->adapt_switches_in_window >= o->adaptive_max_switch_per_sec)
+		return;
+
 	/*
-	 * Decision policy (system-wide CPU):
+	 * Decision policy (system-wide CPU over the just-completed window):
 	 * - In polling mode, drop to interrupt if system busy >= cpu_hi
 	 *   (other workloads are competing for cores; polling is wasteful).
 	 * - In interrupt mode, return to polling if system busy <= cpu_lo
