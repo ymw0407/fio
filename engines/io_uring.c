@@ -1088,6 +1088,7 @@ static int fio_ioring_commit(struct thread_data *td)
 static void fio_ioring_unmap(struct ioring_data *ld);
 static int fio_ioring_queue_init(struct thread_data *td);
 static int fio_ioring_register_files(struct thread_data *td);
+static int adaptive_read_proc_stat(uint64_t *total, uint64_t *idle);
 
 #define ADAPT_DEFAULT_CPU_HI		70
 #define ADAPT_DEFAULT_QD_LO		8
@@ -1186,8 +1187,18 @@ static int fio_ioring_adaptive_init(struct thread_data *td)
 	fio_gettime(&ld->adapt_start_ts, NULL);
 	ld->adapt_last_switch_ts = ld->adapt_start_ts;
 	ld->adapt_window_start = ld->adapt_start_ts;
-	ld->adapt_last_total_jiffies = 0;
-	ld->adapt_last_idle_jiffies = 0;
+
+	/*
+	 * Capture an initial /proc/stat baseline so the first decision (right
+	 * after the startup cooldown expires) computes CPU% over a meaningful
+	 * window (~cooldown_ms) instead of a few milliseconds of noise. Falls
+	 * back to lazy init in the sampler if the read fails.
+	 */
+	if (adaptive_read_proc_stat(&ld->adapt_last_total_jiffies,
+				    &ld->adapt_last_idle_jiffies)) {
+		ld->adapt_last_total_jiffies = 0;
+		ld->adapt_last_idle_jiffies = 0;
+	}
 
 	return 0;
 }
@@ -1319,13 +1330,17 @@ static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
 	fio_gettime(&ld->adapt_last_switch_ts, NULL);
 
 	/*
-	 * Force the next sample to re-baseline. The drain + ring rebuild
-	 * occupies measurable wall time during which the system was mostly
-	 * blocked on close/mmap; folding that into the next CPU% would
-	 * skew the policy and induce oscillation.
+	 * Capture a fresh /proc/stat baseline AFTER the switch completes, so
+	 * the next sample's delta covers the cooldown window (~hundreds of ms,
+	 * many jiffies) instead of just the gap between two adjacent samples
+	 * (sub-ms, 0-1 jiffy → discretization noise that pegs cpu_pct to 0% or
+	 * 100% and induces metronomic oscillation).
 	 */
-	ld->adapt_last_total_jiffies = 0;
-	ld->adapt_last_idle_jiffies = 0;
+	if (adaptive_read_proc_stat(&ld->adapt_last_total_jiffies,
+				    &ld->adapt_last_idle_jiffies)) {
+		ld->adapt_last_total_jiffies = 0;
+		ld->adapt_last_idle_jiffies = 0;
+	}
 
 	log_info("io_uring: adaptive switch -> %s at t=%llu ms (switch #%u)\n",
 		 new_idx == 0 ? "polling" : "interrupt",
@@ -1368,8 +1383,11 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 		return;
 
 	/*
-	 * First sample (or first sample after a switch) just records the
-	 * baseline — we need two readings to compute a delta.
+	 * Lazy-initialize baseline at the very first sample (init couldn't
+	 * call adaptive_read_proc_stat without dragging more deps). Subsequent
+	 * baselines are captured at switch time, NOT here — we want the delta
+	 * computed against the longest available window so the percentage isn't
+	 * dominated by jiffy quantization.
 	 */
 	if (ld->adapt_last_total_jiffies == 0) {
 		ld->adapt_last_total_jiffies = cur_total;
@@ -1379,10 +1397,14 @@ static void fio_ioring_adaptive_sample(struct thread_data *td)
 
 	dt_total = cur_total - ld->adapt_last_total_jiffies;
 	dt_idle = cur_idle - ld->adapt_last_idle_jiffies;
-	ld->adapt_last_total_jiffies = cur_total;
-	ld->adapt_last_idle_jiffies = cur_idle;
 
-	if (dt_total == 0)
+	/*
+	 * Require a minimum window of jiffies for a stable percentage. With
+	 * HZ=100 and N CPUs, every 10ms of wall time produces N jiffies of
+	 * dt_total; we want >= cooldown_ms worth, but cap the wait so the
+	 * sampler still runs even on very low-IOPS workloads.
+	 */
+	if (dt_total < 8)
 		return;
 	if (dt_idle > dt_total)
 		dt_idle = dt_total;
