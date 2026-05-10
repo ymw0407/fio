@@ -165,6 +165,18 @@ struct ioring_data {
 	bool is_uring_cmd_eng;
 
 	struct nvme_cmd_ext_io_opts ext_opts;
+
+	/* adaptive mode runtime state (see adaptive_mode option) */
+	int adapt_active_idx;		/* 0 = polling (SQPOLL), 1 = interrupt */
+	int adapt_sample_countdown;
+	struct timespec adapt_start_ts;
+	struct timespec adapt_last_sample_ts;
+	struct timespec adapt_last_switch_ts;
+	struct timespec adapt_window_start;
+	uint64_t adapt_last_cpu_ns;
+	int adapt_saved_disable_slat;
+	unsigned int adapt_switches;
+	unsigned int adapt_switches_in_window;
 };
 
 struct ioring_options {
@@ -192,6 +204,16 @@ struct ioring_options {
 	unsigned int prchk;
 	char *pi_chk;
 	enum uring_cmd_type cmd_type;
+
+	/* adaptive mode: switch SQPOLL on/off based on CPU and inflight QD */
+	char *adaptive_mode_str;
+	int adaptive_enabled;
+	unsigned int adaptive_cpu_hi;	/* % CPU at/above which we drop to interrupt */
+	unsigned int adaptive_cpu_lo;	/* % CPU below which we may return to SQPOLL */
+	unsigned int adaptive_qd_lo;	/* required inflight QD to justify SQPOLL */
+	unsigned int adaptive_cooldown_ms;
+	unsigned int adaptive_max_switch_per_sec;
+	unsigned int adaptive_sample_every;
 };
 
 static unsigned int enter_flags = IORING_ENTER_GETEVENTS;
@@ -440,6 +462,18 @@ static struct fio_option options[] = {
 		.off1	= offsetof(struct ioring_options, deac),
 		.help	= "Set DEAC (deallocate) flag for write zeroes command",
 		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_IOURING,
+	},
+	{
+		.name	= "adaptive_mode",
+		.lname	= "Adaptive SQPOLL/interrupt switching",
+		.type	= FIO_OPT_STR_STORE,
+		.off1	= offsetof(struct ioring_options, adaptive_mode_str),
+		.help	= "Switch between SQPOLL and interrupt mode at runtime "
+			  "based on CPU usage and inflight queue depth. "
+			  "Format: cpu_hi=N:cpu_lo=N:qd_lo=N:cooldown_ms=N:max_switch_per_sec=N:sample_every=N",
+		.def	= NULL,
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_IOURING,
 	},
@@ -804,6 +838,8 @@ static unsigned fio_ioring_cqring_reap(struct thread_data *td, unsigned int max)
 	return available;
 }
 
+static void fio_ioring_adaptive_sample(struct thread_data *td);
+
 static int fio_ioring_getevents(struct thread_data *td, unsigned int min,
 				unsigned int max, const struct timespec *t)
 {
@@ -813,6 +849,26 @@ static int fio_ioring_getevents(struct thread_data *td, unsigned int min,
 	struct io_cq_ring *ring = &ld->cq_ring;
 	unsigned events = 0;
 	int r;
+
+	if (o->adaptive_enabled) {
+		if (--ld->adapt_sample_countdown <= 0) {
+			unsigned int sw_before = ld->adapt_switches;
+
+			ld->adapt_sample_countdown = o->adaptive_sample_every;
+			fio_ioring_adaptive_sample(td);
+			if (ld->adapt_switches != sw_before) {
+				/*
+				 * The ring was torn down and rebuilt; everything
+				 * inflight was drained inside the sampler via
+				 * io_u_quiesce(). The new ring is empty, so block-
+				 * waiting on it would deadlock. Return 0 and let
+				 * fio's run loop resubmit before re-entering.
+				 */
+				return 0;
+			}
+			ring = &ld->cq_ring;
+		}
+	}
 
 	ld->cq_ring_off = *ring->head;
 	for (;;) {
@@ -1013,6 +1069,339 @@ static int fio_ioring_commit(struct thread_data *td)
 	} while (ld->queued);
 
 	return ret;
+}
+
+/*
+ * --- adaptive mode helpers ---
+ *
+ * The ioring_options has SQPOLL/IOPOLL flags baked into the ring at
+ * io_uring_setup() time. To "switch" we drain all inflight io_us, tear
+ * down the ring (close + munmap), and re-create it with different
+ * setup flags. The drain pause is intentionally part of the measurement
+ * cost of the adaptive policy.
+ *
+ * Two modes:
+ *   adapt_active_idx == 0 : polling mode (SQPOLL on)
+ *   adapt_active_idx == 1 : interrupt mode (SQPOLL off)
+ */
+
+static void fio_ioring_unmap(struct ioring_data *ld);
+static int fio_ioring_queue_init(struct thread_data *td);
+static int fio_ioring_register_files(struct thread_data *td);
+
+#define ADAPT_DEFAULT_CPU_HI		70
+#define ADAPT_DEFAULT_QD_LO		8
+#define ADAPT_DEFAULT_COOLDOWN_MS	500
+#define ADAPT_DEFAULT_MAX_SW_PER_SEC	2
+#define ADAPT_DEFAULT_SAMPLE_EVERY	64
+#define ADAPT_HYSTERESIS_PCT		10
+
+static int adaptive_parse_kv(struct ioring_options *o, const char *kv)
+{
+	const char *eq = strchr(kv, '=');
+	unsigned long val;
+	char *end;
+
+	if (!eq) {
+		log_err("io_uring: adaptive_mode: missing '=' in '%s'\n", kv);
+		return -1;
+	}
+
+	val = strtoul(eq + 1, &end, 10);
+	if (end == eq + 1) {
+		log_err("io_uring: adaptive_mode: bad number in '%s'\n", kv);
+		return -1;
+	}
+
+	if (!strncmp(kv, "cpu_hi=", 7))
+		o->adaptive_cpu_hi = val;
+	else if (!strncmp(kv, "cpu_lo=", 7))
+		o->adaptive_cpu_lo = val;
+	else if (!strncmp(kv, "qd_lo=", 6))
+		o->adaptive_qd_lo = val;
+	else if (!strncmp(kv, "cooldown_ms=", 12))
+		o->adaptive_cooldown_ms = val;
+	else if (!strncmp(kv, "max_switch_per_sec=", 19))
+		o->adaptive_max_switch_per_sec = val;
+	else if (!strncmp(kv, "sample_every=", 13))
+		o->adaptive_sample_every = val;
+	else {
+		log_err("io_uring: adaptive_mode: unknown key '%s'\n", kv);
+		return -1;
+	}
+	return 0;
+}
+
+static int fio_ioring_adaptive_init(struct thread_data *td)
+{
+	struct ioring_options *o = td->eo;
+	struct ioring_data *ld = td->io_ops_data;
+	char *dup, *tok, *save;
+
+	if (!o->adaptive_mode_str)
+		return 0;
+
+	o->adaptive_cpu_hi = ADAPT_DEFAULT_CPU_HI;
+	o->adaptive_cpu_lo = 0;
+	o->adaptive_qd_lo = ADAPT_DEFAULT_QD_LO;
+	o->adaptive_cooldown_ms = ADAPT_DEFAULT_COOLDOWN_MS;
+	o->adaptive_max_switch_per_sec = ADAPT_DEFAULT_MAX_SW_PER_SEC;
+	o->adaptive_sample_every = ADAPT_DEFAULT_SAMPLE_EVERY;
+
+	dup = strdup(o->adaptive_mode_str);
+	if (!dup)
+		return -1;
+
+	tok = strtok_r(dup, ":", &save);
+	while (tok) {
+		if (adaptive_parse_kv(o, tok)) {
+			free(dup);
+			return -1;
+		}
+		tok = strtok_r(NULL, ":", &save);
+	}
+	free(dup);
+
+	if (o->adaptive_cpu_lo == 0) {
+		if (o->adaptive_cpu_hi > ADAPT_HYSTERESIS_PCT)
+			o->adaptive_cpu_lo = o->adaptive_cpu_hi - ADAPT_HYSTERESIS_PCT;
+		else
+			o->adaptive_cpu_lo = 0;
+	}
+	if (o->adaptive_cpu_lo >= o->adaptive_cpu_hi) {
+		log_err("io_uring: adaptive_mode: cpu_lo (%u) must be < cpu_hi (%u)\n",
+			o->adaptive_cpu_lo, o->adaptive_cpu_hi);
+		return -1;
+	}
+
+	o->adaptive_enabled = 1;
+
+	/* Adaptive mode forces SQPOLL on at startup; we toggle it later. */
+	o->sqpoll_thread = 1;
+	o->registerfiles = 1; /* SQPOLL requires registered files */
+
+	ld->adapt_active_idx = 0;
+	ld->adapt_sample_countdown = o->adaptive_sample_every;
+	ld->adapt_saved_disable_slat = td->o.disable_slat;
+	fio_gettime(&ld->adapt_start_ts, NULL);
+	ld->adapt_last_sample_ts = ld->adapt_start_ts;
+	ld->adapt_last_switch_ts = ld->adapt_start_ts;
+	ld->adapt_window_start = ld->adapt_start_ts;
+	ld->adapt_last_cpu_ns = 0;
+
+	return 0;
+}
+
+/*
+ * Read /proc/self/stat fields 14 (utime) and 15 (stime) and convert to ns.
+ * Returns 0 on success, fills *out_ns with cumulative CPU time of this process.
+ */
+static int adaptive_read_proc_cpu_ns(uint64_t *out_ns)
+{
+	FILE *fp;
+	long ticks_per_sec;
+	unsigned long utime, stime;
+	int n;
+	char buf[1024], *p;
+
+	fp = fopen("/proc/self/stat", "r");
+	if (!fp)
+		return -1;
+
+	if (!fgets(buf, sizeof(buf), fp)) {
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	/*
+	 * The 2nd field is comm in parens and may contain spaces or ')'.
+	 * Skip past the last ')' to start scanning from field 3.
+	 */
+	p = strrchr(buf, ')');
+	if (!p)
+		return -1;
+	p++;
+
+	/* From field 3 onward: state(1) ppid(2) pgrp(3) ... utime is field 14, stime is 15.
+	 * After the closing ')' we are about to read field 3, so skip 11 fields (3..13)
+	 * to land on utime, then read utime and stime. */
+	n = sscanf(p, " %*s %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+		   &utime, &stime);
+	if (n != 2)
+		return -1;
+
+	ticks_per_sec = sysconf(_SC_CLK_TCK);
+	if (ticks_per_sec <= 0)
+		ticks_per_sec = 100;
+
+	*out_ns = (uint64_t)(utime + stime) * 1000000000ULL / (uint64_t)ticks_per_sec;
+	return 0;
+}
+
+/*
+ * Tear down the current ring and re-create it with a different SQPOLL setting.
+ * Caller must guarantee no inflight io_us (call io_u_quiesce first).
+ */
+static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+	int ret;
+
+	if (new_idx == ld->adapt_active_idx)
+		return 0;
+
+	/* Drop any unsubmitted SQEs. queued IOs already drained by caller. */
+	ld->queued = 0;
+
+	/* Tear down: unregister buffers (if any), then unmap+close (auto-unregisters files). */
+	if (o->fixedbufs)
+		syscall(__NR_io_uring_register, ld->ring_fd,
+			IORING_UNREGISTER_BUFFERS, NULL, 0);
+
+	fio_ioring_unmap(ld);
+	ld->ring_fd = -1;
+
+	/* Flip the setup flag for the new mode. */
+	if (new_idx == 0) {
+		o->sqpoll_thread = 1;
+		td->o.disable_slat = 1;
+	} else {
+		o->sqpoll_thread = 0;
+		td->o.disable_slat = ld->adapt_saved_disable_slat;
+	}
+
+	ret = fio_ioring_queue_init(td);
+	if (ret) {
+		log_err("io_uring: adaptive switch: queue_init failed (errno=%d)\n",
+			errno);
+		return ret;
+	}
+
+	/* SQEs in the new ring need to be zeroed (mirror post_init). */
+	{
+		unsigned int i;
+		struct io_uring_sqe *sqe;
+		int stride = (ld->is_uring_cmd_eng &&
+			      o->cmd_type == FIO_URING_CMD_NVME) ? 2 : 1;
+
+		for (i = 0; i < ld->iodepth; i++) {
+			sqe = &ld->sqes[i * stride];
+			memset(sqe, 0, stride * sizeof(*sqe));
+		}
+	}
+
+	if (o->registerfiles) {
+		struct fio_file *f;
+		unsigned int i;
+
+		/*
+		 * The previous registration left the real fds in ld->fds[] while
+		 * f->fd was set to -1 ("pretend-closed"). Closing the ring fd does
+		 * NOT close those userspace fds — we must close them ourselves
+		 * before fio_ioring_register_files reopens them, or we leak.
+		 */
+		if (ld->fds) {
+			for (i = 0; i < td->o.nr_files; i++) {
+				if (ld->fds[i] >= 0)
+					close(ld->fds[i]);
+			}
+			free(ld->fds);
+			ld->fds = NULL;
+		}
+		for_each_file(td, f, i)
+			f->engine_pos = 0;
+
+		ret = fio_ioring_register_files(td);
+		if (ret) {
+			log_err("io_uring: adaptive switch: register_files failed (errno=%d)\n",
+				errno);
+			return ret;
+		}
+	}
+
+	ld->adapt_active_idx = new_idx;
+	ld->adapt_switches++;
+	fio_gettime(&ld->adapt_last_switch_ts, NULL);
+
+	log_info("io_uring: adaptive switch -> %s at t=%llu ms (switch #%u)\n",
+		 new_idx == 0 ? "polling" : "interrupt",
+		 (unsigned long long) mtime_since(&ld->adapt_start_ts,
+						  &ld->adapt_last_switch_ts),
+		 ld->adapt_switches);
+
+	return 0;
+}
+
+/*
+ * Sampler — invoked from getevents on a countdown. Decides whether to
+ * tear down and rebuild the ring with a different SQPOLL setting.
+ */
+static void fio_ioring_adaptive_sample(struct thread_data *td)
+{
+	struct ioring_data *ld = td->io_ops_data;
+	struct ioring_options *o = td->eo;
+	struct timespec now;
+	uint64_t cpu_ns_now, dt_wall_ns, dt_cpu_ns;
+	unsigned int cpu_pct;
+	unsigned int qd_now;
+	int want_idx;
+
+	fio_gettime(&now, NULL);
+
+	/* Cooldown: don't switch faster than cooldown_ms. */
+	if (mtime_since(&ld->adapt_last_switch_ts, &now) < o->adaptive_cooldown_ms)
+		return;
+
+	/* Rate cap: max_switch_per_sec sliding window. */
+	if (mtime_since(&ld->adapt_window_start, &now) >= 1000) {
+		ld->adapt_window_start = now;
+		ld->adapt_switches_in_window = 0;
+	}
+	if (ld->adapt_switches_in_window >= o->adaptive_max_switch_per_sec)
+		return;
+
+	if (adaptive_read_proc_cpu_ns(&cpu_ns_now))
+		return;
+
+	dt_wall_ns = utime_since(&ld->adapt_last_sample_ts, &now) * 1000ULL;
+	if (dt_wall_ns == 0 || ld->adapt_last_cpu_ns == 0) {
+		ld->adapt_last_cpu_ns = cpu_ns_now;
+		ld->adapt_last_sample_ts = now;
+		return;
+	}
+	dt_cpu_ns = cpu_ns_now - ld->adapt_last_cpu_ns;
+	cpu_pct = (unsigned int)((dt_cpu_ns * 100ULL) / dt_wall_ns);
+
+	ld->adapt_last_cpu_ns = cpu_ns_now;
+	ld->adapt_last_sample_ts = now;
+
+	qd_now = td->cur_depth;
+
+	/*
+	 * Decision policy:
+	 * - In polling (SQPOLL) mode, drop to interrupt if CPU > cpu_hi
+	 *   (the SQPOLL kthread itself burns a core, so this triggers easily
+	 *   under contention from other workloads).
+	 * - In interrupt mode, return to polling if CPU < cpu_lo AND inflight
+	 *   QD >= qd_lo (enough parallelism to amortize the polling cost).
+	 */
+	want_idx = ld->adapt_active_idx;
+	if (ld->adapt_active_idx == 0 && cpu_pct >= o->adaptive_cpu_hi)
+		want_idx = 1;
+	else if (ld->adapt_active_idx == 1 &&
+		 cpu_pct <= o->adaptive_cpu_lo && qd_now >= o->adaptive_qd_lo)
+		want_idx = 0;
+
+	if (want_idx == ld->adapt_active_idx)
+		return;
+
+	if (io_u_quiesce(td) < 0)
+		return;
+
+	if (fio_ioring_switch_mode(td, want_idx) == 0)
+		ld->adapt_switches_in_window++;
 }
 
 static void fio_ioring_unmap(struct ioring_data *ld)
@@ -1474,6 +1863,10 @@ static int fio_ioring_init(struct thread_data *td)
 	int ret, i;
 	struct nvme_cmd_ext_io_opts *ext_opts;
 
+	/* Adaptive mode starts in SQPOLL state; force the prerequisite flags. */
+	if (o->adaptive_mode_str)
+		o->sqpoll_thread = 1;
+
 	/* sqthread submission requires registered files */
 	if (o->sqpoll_thread)
 		o->registerfiles = 1;
@@ -1575,7 +1968,16 @@ static int fio_ioring_init(struct thread_data *td)
 	}
 
 	if (ld->is_uring_cmd_eng)
-		return fio_ioring_cmd_init(td, ld);
+		ret = fio_ioring_cmd_init(td, ld);
+	else
+		ret = 0;
+
+	if (ret)
+		return ret;
+
+	if (fio_ioring_adaptive_init(td))
+		return 1;
+
 	return 0;
 }
 
