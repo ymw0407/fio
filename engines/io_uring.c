@@ -1319,8 +1319,9 @@ static int fio_ioring_switch_mode(struct thread_data *td, int new_idx)
 		if (ld->fds) {
 			for_each_file(td, f, i) {
 				if (ld->fds[i] >= 0) {
+					int fio_unused cret;
 					f->fd = ld->fds[i];
-					generic_close_file(td, f);
+					cret = generic_close_file(td, f);
 					/* generic_close_file sets f->fd = -1 */
 				}
 			}
